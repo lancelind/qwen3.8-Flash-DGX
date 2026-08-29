@@ -5,6 +5,9 @@ container: ghcr.io/lancelind/qwen38-flash-dgx:latest
 min_nodes: 1
 max_nodes: 1
 
+executor_config:
+  entrypoint: ""
+
 metadata:
   description: >-
     Qwen3.8-Flash-Next NVFP4 with YaRN rope scaling (factor 4) for ~500k

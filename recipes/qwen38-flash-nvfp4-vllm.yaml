@@ -7,6 +7,11 @@ container: ghcr.io/lancelind/qwen38-flash-dgx:latest
 min_nodes: 1
 max_nodes: 1
 
+# The base image's ENTRYPOINT is ["vllm","serve"] (no setup wrapper), which
+# would consume sparkrun's `bash -c` launcher — run our full command instead.
+executor_config:
+  entrypoint: ""
+
 metadata:
   description: >-
     Qwen3.8-Flash-Next NVFP4 (~176B) on a single DGX Spark / GB10. PLE n-gram
