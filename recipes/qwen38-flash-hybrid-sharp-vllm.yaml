@@ -1,47 +1,51 @@
 recipe_version: "2"
-model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+model: travelinlance/Qwen3.8-Flash-Next-RadixArk-NVFP4-Hybrid-Sharp
 runtime: vllm
 container: ghcr.io/lancelind/qwen38-flash-dgx:latest
 min_nodes: 1
 max_nodes: 1
 
+# The base image's ENTRYPOINT is ["vllm","serve"] (no setup wrapper), which
+# would consume sparkrun's `bash -c` launcher — run our full command instead.
 executor_config:
   entrypoint: ""
 
 metadata:
   description: >-
-    Qwen3.8-Flash-Next NVFP4 with YaRN rope scaling (factor 4) for ~500k
-    context on a single DGX Spark. Same patched image as the base recipe.
+    Qwen3.8-Flash-Next NVFP4 with fp8-hybrid side layers and the Sharp chat
+    template (travelinlance build) on a single DGX Spark / GB10. PLE n-gram
+    table mmapped from NVMe; deterministic exact QSA top-k; prefix caching on.
   maintainer: lancelind
-  model_vram: 76   # GB; PLE table is mmapped from NVMe, not resident
+  # VRAM override (units: GB): hybrid side layers cut resident weights below
+  # the nvfp4 build's ~76 GB; PLE table lives on NVMe via mmap.
+  model_vram: 69
   kv_dtype: bf16
 
 defaults:
   port: 8000
   host: 0.0.0.0
   served_model_name: qwen3.8-flash-next
-  max_model_len: 500000
+  max_model_len: 262144
   max_num_seqs: 8
   max_num_batched_tokens: 8192
-  # keep extra headroom for long prefills at 500k context
-  gpu_memory_utilization: 0.80
-  kv_cache_dtype: auto
+  gpu_memory_utilization: 0.85
+  kv_cache_dtype: auto        # keep auto (=bf16): fp8 is refused by the QSA layers
   load_format: safetensors
   tool_call_parser: qwen3_coder
   reasoning_parser: qwen3
-  # dict hf_overrides don't propagate to the MTP draft model, whose max_model_len
-  # would stay 262144 — force it through the speculative config (see serve.sh).
-  speculative_config: '{"method": "mtp", "num_speculative_tokens": 2, "max_model_len": 500000}'
-  hf_overrides: '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
+  speculative_config: '{"method": "mtp", "num_speculative_tokens": 2}'
+  # PLE gather is a CPU op + pageable H2D copy: must stay outside CUDA graphs,
+  # hence PIECEWISE capture with ple_mmap_lookup declared as a splitting op.
   compilation_config: '{"cudagraph_mode":"PIECEWISE","splitting_ops":["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]}'
 
 env:
-  VLLM_PLE_MMAP: "1"
+  VLLM_PLE_MMAP: "1"            # serve the PLE table from disk
   VLLM_PLE_MMAP_WORKERS: "32"
   VLLM_PLE_MMAP_PREWARM: "0"
-  VLLM_QSA_EXACT_TOPK: "1"
+  VLLM_QSA_EXACT_TOPK: "1"      # deterministic top-k
   VLLM_USE_FLASHINFER_SAMPLER: "1"
-  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_FP8_HYBRID: "1"          # enable the fp8 side-layer dispatch
+  VLLM_USE_DEEP_GEMM: "0"       # required with hybrid mode (see serve.sh)
 
 command: |
   vllm serve {model} \
@@ -58,7 +62,6 @@ command: |
     --compilation-config '{compilation_config}' \
     --no-enable-flashinfer-autotune \
     --kv-cache-dtype {kv_cache_dtype} \
-    --hf-overrides '{hf_overrides}' \
     --enable-auto-tool-choice \
     --tool-call-parser {tool_call_parser} \
     --reasoning-parser {reasoning_parser} \
