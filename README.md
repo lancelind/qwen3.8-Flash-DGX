@@ -23,6 +23,41 @@ kernel that drops candidates) — and offers an optional **hybrid** checkpoint l
 > [issue #1](https://github.com/blazux/qwen3.8-Flash-DGX/issues/1) and their
 > [write-up](https://github.com/jschmied/qwen38-flash-next-gb10).
 
+## Running with sparkrun
+
+This fork adds [sparkrun](https://sparkrun.dev/) recipes so the whole thing is
+one command on a fresh Spark — no manual `docker build`, weight download, or
+`serve.sh`:
+
+```bash
+sparkrun registry add https://github.com/lancelind/qwen3.8-Flash-DGX
+sparkrun run qwen38-flash-nvfp4-vllm --solo
+```
+
+sparkrun pulls the patched image from
+`ghcr.io/lancelind/qwen38-flash-dgx` (built by CI from this repo's Dockerfile),
+downloads `RadixArk/Qwen3.8-Flash-Next-NVFP4` into its model cache, and serves
+the OpenAI-compatible API on port 8000 (override with `-o port=18300`).
+
+Recipes:
+
+- [`recipes/qwen38-flash-nvfp4-vllm.yaml`](recipes/qwen38-flash-nvfp4-vllm.yaml) —
+  the default: 262k context, prefix caching, exact top-k, MTP=2.
+- [`recipes/qwen38-flash-nvfp4-yarn500k-vllm.yaml`](recipes/qwen38-flash-nvfp4-yarn500k-vllm.yaml) —
+  YaRN rope scaling for ~500k context.
+
+Notes:
+
+- **Single node only** (`max_nodes: 1`): the PLE table is mmapped from local
+  NVMe; there is no multi-Spark tensor parallelism here.
+- Any `defaults:` key can be overridden per-run, e.g.
+  `-o gpu_memory_utilization=0.80 -o max_num_seqs=16`.
+- **Hybrid mode** (`MODE=hybrid`) is not covered by a recipe yet: its fp8
+  side-layer checkpoint is generated locally by `scripts/prepare-hybrid.sh`.
+  Either keep using `serve.sh` for it, or upload the prepared checkpoint to
+  Hugging Face and point a copy of the recipe at it with
+  `env: {VLLM_FP8_HYBRID: "1", VLLM_USE_DEEP_GEMM: "0"}`.
+
 ## Update 2026-08-29 — what changed
 
 If you cloned this before, here is the short version (details in the linked sections):

@@ -1,0 +1,63 @@
+recipe_version: "2"
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: vllm
+container: ghcr.io/lancelind/qwen38-flash-dgx:latest
+# The PLE mmap design serves the 44 GiB n-gram table from local NVMe — strictly
+# single-node; do not attempt tensor parallelism across Sparks.
+min_nodes: 1
+max_nodes: 1
+
+metadata:
+  description: >-
+    Qwen3.8-Flash-Next NVFP4 (~176B) on a single DGX Spark / GB10. PLE n-gram
+    table served from disk via mmap so the 122 GiB checkpoint fits alongside
+    usable KV cache. Deterministic exact QSA top-k and fixed prefix caching on.
+  maintainer: lancelind
+  # Override VRAM estimation: the 44 GiB PLE table lives on NVMe (mmap), not in
+  # the 128 GB unified pool — a stock 176B estimate would refuse a solo launch.
+  model_vram: 76e9
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: qwen3.8-flash-next
+  max_model_len: 262144
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  # 0.875 got OOM-killed on a 300k prefill with MTP; use 0.80 for long-running service.
+  gpu_memory_utilization: 0.85
+  kv_cache_dtype: auto        # keep auto (=bf16): fp8 is refused by the QSA layers
+  load_format: safetensors
+  tool_call_parser: qwen3_coder
+  reasoning_parser: qwen3
+  speculative_config: '{"method": "mtp", "num_speculative_tokens": 2}'
+  # PLE gather is a CPU op + pageable H2D copy: must stay outside CUDA graphs,
+  # hence PIECEWISE capture with ple_mmap_lookup declared as a splitting op.
+  compilation_config: '{"cudagraph_mode":"PIECEWISE","splitting_ops":["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]}'
+
+env:
+  VLLM_PLE_MMAP: "1"            # the patch that makes it fit
+  VLLM_PLE_MMAP_WORKERS: "32"   # threads for the mmap gather
+  VLLM_PLE_MMAP_PREWARM: "0"    # 1 = stream the table once at boot to warm the page cache
+  VLLM_QSA_EXACT_TOPK: "1"      # deterministic top-k; 0 = stock kernel (faster, non-deterministic)
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+
+command: |
+  vllm serve {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --load-format {load_format} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --compilation-config '{compilation_config}' \
+    --no-enable-flashinfer-autotune \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --enable-auto-tool-choice \
+    --tool-call-parser {tool_call_parser} \
+    --reasoning-parser {reasoning_parser} \
+    --speculative-config '{speculative_config}'

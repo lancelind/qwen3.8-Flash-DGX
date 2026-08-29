@@ -1,0 +1,4 @@
+registries:
+  - name: qwen38-flash-dgx
+    description: Qwen3.8-Flash-Next on a single DGX Spark (mmapped PLE table, patched vLLM)
+    recipes: recipes
