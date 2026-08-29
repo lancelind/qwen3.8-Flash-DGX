@@ -10,7 +10,8 @@ metadata:
     Qwen3.8-Flash-Next NVFP4 with YaRN rope scaling (factor 4) for ~500k
     context on a single DGX Spark. Same patched image as the base recipe.
   maintainer: lancelind
-  model_vram: 76e9
+  model_vram: 76   # GB; PLE table is mmapped from NVMe, not resident
+  kv_dtype: bf16
 
 defaults:
   port: 8000

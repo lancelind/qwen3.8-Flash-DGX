@@ -13,9 +13,11 @@ metadata:
     table served from disk via mmap so the 122 GiB checkpoint fits alongside
     usable KV cache. Deterministic exact QSA top-k and fixed prefix caching on.
   maintainer: lancelind
-  # Override VRAM estimation: the 44 GiB PLE table lives on NVMe (mmap), not in
-  # the 128 GB unified pool — a stock 176B estimate would refuse a solo launch.
-  model_vram: 76e9
+  # Override VRAM estimation (units: GB): the 44 GiB PLE table lives on NVMe
+  # (mmap), not in the 128 GB unified pool — a stock 176B estimate would refuse
+  # a solo launch.
+  model_vram: 76
+  kv_dtype: bf16  # kv_cache_dtype 'auto' resolves to bf16 on this model
 
 defaults:
   port: 8000
