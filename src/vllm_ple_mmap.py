@@ -63,6 +63,9 @@ import torch.nn as nn
 logger = logging.getLogger("vllm.ple_mmap")
 
 ENV_ENABLE = "VLLM_PLE_MMAP"
+ENV_GPU_GATHER = "VLLM_PLE_GPU_GATHER"
+ENV_GPU_SO = "VLLM_PLE_GPU_SO"  # path to ple_gpu_gather.so (default: baked into image)
+_GPU_SO_DEFAULT = "/opt/ple_gpu_gather.so"
 _FP8_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2,
@@ -78,6 +81,42 @@ _TABLE_DTYPES = {
 
 def enabled() -> bool:
     return os.environ.get(ENV_ENABLE, "0").lower() in ("1", "true", "yes")
+
+
+def gpu_gather_enabled() -> bool:
+    return os.environ.get(ENV_GPU_GATHER, "0").lower() in ("1", "true", "yes")
+
+
+_GPU_LIB = None
+
+
+def _gpu_lib():
+    """ctypes handle to ple_gpu_gather.so (loaded once); None if unavailable.
+
+    The .so is compiled at image build (Dockerfile) — nothing is built at
+    runtime, so a fresh sparkrun launch needs no prep.
+    """
+    global _GPU_LIB
+    if _GPU_LIB is not None:
+        return _GPU_LIB or None
+    import ctypes
+
+    path = os.environ.get(ENV_GPU_SO, _GPU_SO_DEFAULT)
+    try:
+        lib = ctypes.CDLL(path)
+        lib.ple_gpu_gather.restype = ctypes.c_int
+        lib.ple_gpu_gather.argtypes = [
+            ctypes.c_void_p, ctypes.c_longlong, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
+            ctypes.c_void_p,
+        ]
+        _GPU_LIB = lib
+        logger.info("PLE mmap: GPU gather library loaded from %s", path)
+    except OSError as exc:
+        _GPU_LIB = False
+        logger.warning("PLE mmap: GPU gather requested but %s not loadable (%s); "
+                       "falling back to CPU gather", path, exc)
+    return _GPU_LIB or None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -134,6 +173,45 @@ class MmapPleTable:
             self.rows_total += rows
         self.pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
         self.fast_rows = _env_int("VLLM_PLE_MMAP_FAST_ROWS", 512)
+        # GPU gather (ATS): host virtual addresses of each shard's row region.
+        # On GB10 (Addressing Mode: ATS) a CUDA kernel dereferences these
+        # pageable addresses directly through the CPU page tables — verified
+        # on-box (byte-identical, graph-capturable). Missing shards -> 0 so an
+        # out-of-range id faults loudly instead of reading garbage.
+        self._base_addrs = [
+            (mm.ctypes.data if mm is not None else 0) for mm in self.mm
+        ]
+        self._bases_dev: torch.Tensor | None = None
+
+    def _shard_bases_dev(self, device: torch.device) -> torch.Tensor:
+        if self._bases_dev is None or self._bases_dev.device != device:
+            self._bases_dev = torch.tensor(
+                self._base_addrs, dtype=torch.int64, device=device
+            )
+        return self._bases_dev
+
+    def gather_gpu(self, ids: torch.Tensor) -> torch.Tensor:
+        """ids: int64 CUDA tensor [N] -> uint8 CUDA tensor [N, row_bytes].
+
+        Zero-copy: the kernel reads the mmap'd table through ATS on the current
+        stream. No CPU sync, no dedup (torch.unique would break CUDA graph
+        capture; duplicate rows are page-cache hits), no pinned staging.
+        """
+        lib = _gpu_lib()
+        assert lib is not None, "GPU gather library not loaded"
+        n = ids.numel()
+        out = torch.empty((n, self.row_bytes), dtype=torch.uint8, device=ids.device)
+        if n == 0:
+            return out
+        bases = self._shard_bases_dev(ids.device)
+        stream = torch.cuda.current_stream(ids.device).cuda_stream
+        rc = lib.ple_gpu_gather(
+            bases.data_ptr(), self.shard_size, ids.data_ptr(),
+            out.data_ptr(), self.row_bytes, n, stream,
+        )
+        if rc != 0:
+            raise RuntimeError(f"ple_gpu_gather kernel launch failed: CUDA error {rc}")
+        return out
 
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """ids: int64 [N] global row ids -> uint8 [N, row_bytes] (a fresh array)."""
@@ -260,6 +338,26 @@ class _MmapNgramEmbedding(nn.Module):
                 dtype=self._zeros_dtype,
                 device=ids.device,
             )
+        if (
+            gpu_gather_enabled()
+            and ids.device.type == "cuda"
+            and ids.numel() <= _env_int("VLLM_PLE_GPU_GATHER_MAX_ROWS", 4096)
+            and _gpu_lib() is not None
+        ):
+            # Size-branched placement, measured on-box: the GPU (ATS) gather wins
+            # for decode-sized lookups (small, page-cache-warm, graph-capturable:
+            # 0.02 ms vs 4.3 ms CPU for 2048 rows) but loses badly for
+            # prefill-sized ones (~130k rows, cold pages: GPU faults serialize
+            # while the CPU threadpool overlaps 32 at a time — C5 throughput
+            # halved when everything went through the kernel). Decode shapes
+            # capture the GPU branch inside CUDA graphs; prefill takes the CPU
+            # path below, outside capture, exactly as before.
+            # ATS path: gather on-device straight from the mmap. Ids from the
+            # stock hashing are in-range by construction (hash % vocab), and
+            # skipping the range check avoids a capture-breaking sync.
+            rows_dev = table.gather_gpu(ids.reshape(-1).to(torch.int64))
+            out = rows_dev.view(table.torch_dtype)
+            return out.reshape(*ids.shape, self.embedding_dim)
         ids_np = ids.detach().to("cpu", non_blocking=False).numpy().reshape(-1)
         # Dedup on CPU, gather only unique rows, expand on the GPU: fewer disk
         # reads AND fewer H2D bytes (repeated n-grams are the common case).

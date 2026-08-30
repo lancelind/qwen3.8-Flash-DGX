@@ -93,3 +93,16 @@ RUN cp ${MO} ${MO}.orig \
 # Verified on-box: required+none, named+none, auto+default, required+default all 6/6.
 COPY src/patch_toolchoice_enforcement.py /tmp/patch_toolchoice_enforcement.py
 RUN python3 /tmp/patch_toolchoice_enforcement.py ${SP} && rm /tmp/patch_toolchoice_enforcement.py
+
+# --- 8. GPU-side PLE gather via ATS (VLLM_PLE_GPU_GATHER=1) -----------------------
+# On GB10 (Addressing Mode: ATS) a CUDA kernel dereferences the mmap'd PLE table
+# directly through the CPU page tables: zero-copy, no pinned staging, no per-step
+# CPU sync — and the lookup becomes CUDA-graph-capturable, so `ple_mmap_lookup`
+# no longer has to split the piecewise graphs. Probe-verified on-box: gathers
+# byte-identical to CPU, 0.195 ms warm / 0.216 ms in-graph for 4096 x 160 B.
+# Off by default; the CPU gather path is unchanged and remains the fallback.
+# sm_121 = GB10 (verified against this toolchain's --list-gpu-arch).
+COPY src/ple_gpu_gather.cu /tmp/ple_gpu_gather.cu
+RUN nvcc -O2 -shared -Xcompiler -fPIC -gencode arch=compute_121,code=sm_121 \
+      -o /opt/ple_gpu_gather.so /tmp/ple_gpu_gather.cu \
+ && rm /tmp/ple_gpu_gather.cu && ls -la /opt/ple_gpu_gather.so

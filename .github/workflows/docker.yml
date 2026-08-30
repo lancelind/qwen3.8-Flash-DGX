@@ -2,7 +2,7 @@ name: Build and push image
 
 on:
   push:
-    branches: [main]
+    branches: [main, ple-gpu-lookup]
     tags: ["v*"]
     paths-ignore: ["recipes/**", "docs/**", "README.md", ".sparkrun/**"]
   workflow_dispatch:
@@ -39,6 +39,7 @@ jobs:
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=v2,enable=${{ github.ref == 'refs/heads/ple-gpu-lookup' }}
 
       - uses: docker/build-push-action@v6
         with:
