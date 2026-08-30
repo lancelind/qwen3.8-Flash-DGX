@@ -82,3 +82,14 @@ RUN cp ${MO} ${MO}.orig \
  && sed -i 's/^from \. import model$/from . import model\nfrom vllm_fp8_hybrid_modelopt import excluded_quant_config as _fp8_hybrid_excluded/' ${QSA} \
  && grep -q "_fp8_hybrid_excluded(quant_config)" ${QSA} && grep -q "^from vllm_fp8_hybrid_modelopt import" ${QSA} \
  && python3 -c "import ast; ast.parse(open('${QSA}').read()); print('qsa.py hooked OK')"
+
+# --- 7. tool_choice required/named enforcement fix --------------------------------
+# ParserEngine.adjust_request (engine-based parsers, incl. qwen3_coder) dropped the
+# structural-tag grammar attachment the base Parser.adjust_request performs, so
+# tool_choice="required" and named tool_choice were silently unenforced on the chat
+# path (prose answers with finish_reason "tool_calls"). This restores the grammar;
+# the structural_tag_model lookup scans the adapter's subclasses because the marker
+# lives on the registered tool parser, not the auto-generated adapter.
+# Verified on-box: required+none, named+none, auto+default, required+default all 6/6.
+COPY src/patch_toolchoice_enforcement.py /tmp/patch_toolchoice_enforcement.py
+RUN python3 /tmp/patch_toolchoice_enforcement.py ${SP} && rm /tmp/patch_toolchoice_enforcement.py
