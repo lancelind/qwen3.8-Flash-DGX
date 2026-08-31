@@ -96,7 +96,7 @@ Measured on the GX10 with the mmap patch, `GPU_MEM=0.85`, MTP=2 unless noted.
 | 262144 native, MTP | KV pool ~720–790k tokens, ~3× concurrency at full length. Baseline prod. |
 | **YaRN, CTX 500000, MTP** | **Works.** Pool ~724k tokens. Needle-in-a-haystack found at 276k and 414k tokens; decode 25–28 tok/s typical (36 on predictable text, ~94% draft acceptance there); no OOM. **This is the validated ceiling.** |
 | YaRN, CTX 800000, MTP, `GPU_MEM=0.875` | Boots (pool 928k) and answers, but a 300k-token prefill got **SIGTERM from earlyoom** at 1.96% free memory: the prefill's activation peak plus the draft do not fit in ~5 GiB of headroom. |
-| `--kv-cache-dtype fp8` | **Refused by the model**: `NotImplementedError: Qwen3.8-Flash-Next QSA requires a BF16 main KV cache`. So the "halve the KV" lever does not exist; at ~29 KB/token a single 1M request needs ~30 GiB of KV. |
+| `--kv-cache-dtype fp8_e4m3` | Refused by the stock model (`QSA requires a BF16 main KV cache`); enabled by @Nanetnounou's patch in this image — see [fp8 KV cache](#fp8-kv-cache-on-the-qsa-path-opt-in). In bf16 a single 1M request needs 26.3 GiB of KV (28 KB/token, of which the attention K/V is the only part fp8 halves). |
 
 Two YaRN-specific traps, both handled by `scripts/serve.sh`:
 
@@ -215,18 +215,23 @@ What we saw on GB10, in order:
 
 The bug: `EngineCore._initialize_kv_caches` (`vllm/v1/engine/core.py`) sets
 `cache_config.block_size = min(group.block_size for every KV group)`. For this model
-one of the groups is the QSA raw-key ring (`CircularBufferSpec`), whose block is 8 or
-16 tokens. `cache_config.mamba_block_size` stays 1600, but two consumers used
+one of the groups is the QSA raw-key ring (`CircularBufferSpec`, `qsa_cache.py`), whose
+block is its ring capacity `compress_ratio × cdiv(compress_ratio + num_spec, compress_ratio)`
+= 8 tokens with MTP=2, 4 without. (This group type does not exist on upstream vLLM `main`,
+where the same `min()` is harmless because every group is 1600.) `cache_config.mamba_block_size` stays 1600, but two consumers used
 `cache_config.block_size` *as* the Mamba block size:
 
 - `v1/worker/gpu/model_states/mamba_hybrid.py`, `add_request`: the running state slot
-  is seeded from `(num_computed_tokens - 1) // block_size` → `3199 // 16 = 199` instead
-  of `1`. Column 199 is past the end of the request's Mamba block-table row, the
+  is seeded from `(num_computed_tokens - 1) // block_size` → `3199 // 8 = 399` instead
+  of `1`. Column 399 is past the end of the request's Mamba block-table row, the
   persistent table is zero-filled there, block id 0 is the null block — in range, so the
   guard never fires — and its all-zero page is copied in as the "restored" state.
 - `v1/core/sched/scheduler.py`, `_mamba_block_aligned_split`: prefill chunks were
-  aligned to 16-token boundaries instead of 1600, so states were almost never captured
-  at a real boundary and cold requests rarely cached anything.
+  aligned to 8-token boundaries instead of 1600, so states were almost never captured
+  at a real boundary and cold requests rarely cached anything. This is directly visible
+  in the traces: a 5,150-token cold prompt stopped its chunk at 5,136 with MTP=2
+  (`5150 - 5150 % 8 - 8`, the Eagle back-off) and at 5,148 with MTP=0 (`5150 - 5150 % 4`)
+  — exactly the ring block sizes, never 4,800.
 
 The fix (`src/patch_mamba_block_size.py`) is two lines: use
 `cache_config.mamba_block_size` in the first and the scheduler's own `self.block_size`
@@ -311,3 +316,31 @@ behavioural nuance rather than a precision loss; every tool call it made was cor
 The Intel AutoRound variant is fastest at raw decode but could not be made
 deterministic and has the worst cached-TTFT (its prefill is the slowest), so we did not
 adopt it; the numbers are here for completeness.
+
+## fp8 KV cache on the QSA path (opt-in)
+
+vLLM already had the plumbing (`kv_quant_mode`, `_k_scale`/`_v_scale`, allocation and
+writes) — what was missing for this model was the read side: the QSA Triton kernels
+loaded the cache as bf16 and five guards rejected anything else.
+[@Nanetnounou](https://github.com/Nanetnounou)'s `src/patch_qsa_fp8_kv.py`
+([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6)) wires vLLM's own
+`_cast_kv_tile` into the decode and MQA (block-selector) kernels, reinterprets the
+`uint8` allocation as `float8_e4m3fn` — for the main KV *and* the indexer's raw-key ring,
+which otherwise picks arbitrary blocks — halves `block_n` under quantization to stay
+under the GB10's 101,376-byte shared memory, and neutralises the dtype guard inherited
+from `FlashAttentionImpl` (whose kernels QSA never calls). Inert with `--kv-cache-dtype auto`.
+
+Measured (hybrid, MTP=2, exact top-k, prefix caching, `GPU_MEM=0.80`, `CTX=1000000` YaRN):
+KV pool 1,219,879 tokens (bf16 at 500k: 634k) and a 1M single request boots with 1.22×
+concurrency; decode 27.9 vs 30.8 tok/s, prefill 32k 1,254 vs 1,794 tok/s, needle 92k
+89 s vs 69 s; tournament 45/51 with the usual b6/c5 failures, but `b3_itinerary` falls
+from 6/6 to 2/6 passes (and its one success took 193 s instead of ~50 s; the failures ran
+to the 412 s cap). vLLM raises the attention block to 3,184 tokens in this mode to keep
+attention and Mamba pages equal. Note for anyone sizing this: the fp8 saving applies to
+the attention K/V only — the GDN/PLE recurrent states, the QSA compressed keys and the
+raw-key ring stay as they are — which is why bf16 at 1M asked for 26.3 GiB and fp8 gets
+1M into 17 GiB.
+
+We keep bf16 in production: the model's speed is our scarcest resource and the b3
+regression is the kind of long-reasoning case we care about. The option is there for
+workloads that need the context.

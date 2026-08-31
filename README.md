@@ -64,25 +64,36 @@ If you cloned this before, here is the short version (details in the linked sect
 
 - **Prefix caching works now** — `--enable-prefix-caching` was crashing, then silently
   returning wrong answers on cache hits. Root cause was a vLLM block-size bug that made
-  every prefix hit restore an *all-zero* Mamba state; two-line fix in the image.
+  every prefix hit restore an *all-zero* Mamba state; two-line fix in the image. Getting
+  there took [@Saren-Arterius](https://github.com/Saren-Arterius)'s pointer to
+  vllm#50729 and their state-copy guard, and [@0xBakeer](https://github.com/0xBakeer)'s
+  attempt to reproduce it, which sharpened the write-up.
   `PREFIX_CACHE=1` is the new default. Repeated prefixes (system prompts, multi-turn,
   tool loops) skip the prefill: ~14 s → ~1.4 s TTFT on a 20k-token prefix.
   → [Prefix caching now works](#prefix-caching-now-works-and-why-it-didnt)
 - **Greedy decoding is deterministic now** — the GB10 sparse-attention top-k kernel was
-  non-deterministic and dropped candidates (reported by @k3dani, issue #3). Exact top-k
+  non-deterministic and dropped candidates, diagnosed and reported upstream by
+  [@k3dani](https://github.com/k3dani) (issue #3, vllm#51782). Exact top-k
   is the new default (`EXACT_TOPK=1`); identical outputs at temperature 0, same
   tournament score, costs some long-prefill speed. → [Deterministic top-k](#deterministic-top-k-exact_topk1-default)
 - **Two checkpoint modes** — `MODE=nvfp4` (as published) or `MODE=hybrid` (NVFP4 experts
   + fp8 side layers, one-time `scripts/prepare-hybrid.sh`): **+20% decode, +8% KV,
-  same quality**. Our box runs the hybrid. → [Two checkpoint modes](#two-checkpoint-modes-nvfp4-or-hybrid)
-- **Also in the image**: vllm#50729 (Mamba state-copy race) + a bounds guard, the
-  GB10 FLA fixes and the faster PLE gather from @Saren-Arterius's fork.
+  same quality**. Our box runs the hybrid. The fp8 side-layer conversion and the
+  original int4+fp8 dispatch it is ported from are
+  [@Saren-Arterius](https://github.com/Saren-Arterius)'s. → [Two checkpoint modes](#two-checkpoint-modes-nvfp4-or-hybrid)
+- **Also in the image**: vllm#50729 (Mamba state-copy race, by
+  [@AndreasKaratzas](https://github.com/AndreasKaratzas)) + a bounds guard, the GB10 FLA
+  fixes and the faster PLE gather from [@Saren-Arterius](https://github.com/Saren-Arterius)'s fork.
 - **We benchmarked the int4 (Intel AutoRound) variant too** with the same patches:
   fastest raw decode, but not deterministic and slowest cached-TTFT, so we did not adopt
   it. Numbers in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md#hybrid-mode-nvfp4-experts--blockwise-fp8-side-layers).
+- **fp8 KV cache is available** (`KV_DTYPE=fp8_e4m3`), contributed by
+  [@Nanetnounou](https://github.com/Nanetnounou): ×1.9 KV, 1M context on one box — at a
+  speed and quality cost, so it is opt-in. → [fp8 KV cache](#optional-fp8-kv-cache-1m-context)
 - `scripts/smoke-test.sh` now also checks the prefix-cache hit and determinism, and
   measures decode on a real answer instead of `ignore_eos` (which produces meaningless
-  numbers with this model).
+  numbers with this model). `scripts/download-weights.sh` now forwards `HF_TOKEN`
+  ([@wawimundo](https://github.com/wawimundo), PR #4).
 
 Everything was measured on one ASUS GX10 with a 17-scenario agentic tournament (3 repeats
 each), single-request speed benches on real prompts, and state checksums for the
@@ -183,10 +194,10 @@ Our own box runs the hybrid. If you want the checkpoint exactly as published, st
 access`) and, with a bounds guard in place, to **silently return different answers on
 cache hits**. We traced it (details in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)):
 vLLM's engine core overwrites `cache_config.block_size` with the *smallest* KV-group
-block size — 16 tokens here, because of the QSA raw-key ring — while the Mamba state
-block is 1600 tokens. Two places used the former as the latter, so on a prefix hit the
-worker computed the state slot as `(3200-1)//16` instead of `1`, read past the block
-table row, and restored an **all-zero Mamba state**. The image carries a two-line fix;
+block size — 8 tokens here with MTP=2 (4 without), the QSA raw-key ring — while the Mamba
+state block is 1600 tokens. Two places used the former as the latter, so on a prefix hit
+the worker computed the state slot as `(3200-1)//8 = 399` instead of `1`, read past the
+block table row, and restored an **all-zero Mamba state**. The image carries a two-line fix;
 with it, cold and cache-hit outputs are bit-identical (state checksums and first-token
 logprobs match exactly) and the tournament score is unchanged.
 
@@ -214,20 +225,49 @@ score unchanged. Cost: nothing on decode, ~10% on 8k prefill, ~20–40% on 32k+ 
 (We also tried just masking the never-written columns before the stock kernel: still
 unstable, so it is the kernel itself.)
 
+## Optional: fp8 KV cache (1M context)
+
+[@Nanetnounou](https://github.com/Nanetnounou) contributed a patch
+([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6),
+[vllm#54426](https://github.com/vllm-project/vllm/issues/54426)) that lets the QSA
+layers read an `fp8_e4m3` KV cache — the model used to refuse anything but bf16. It is
+in the image, inert unless you pass `KV_DTYPE=fp8_e4m3`. Measured on the GX10 (hybrid,
+MTP=2, exact top-k, prefix caching, `GPU_MEM=0.80`):
+
+| | bf16 KV (default) | `KV_DTYPE=fp8_e4m3` |
+|---|---|---|
+| KV pool | 634k tokens | **1,219k tokens (×1.9)** |
+| Max single request | 500k (YaRN) | **1,000k (YaRN)** — boots and serves |
+| Decode | 30.8 tok/s | 27.9 tok/s (−9%) |
+| Prefill 32k | 1,794 tok/s | 1,254 tok/s (−30%) |
+| Needle 92k | 69 s | 89 s |
+| Tournament | 45/51 | 45/51, but `b3_itinerary` (long multi-constraint reasoning) drops from 6/6 to 2/6 passes and its successful run took 4× longer |
+
+The slowdown comes from the in-kernel dequantization and the halved `block_n` needed to
+fit the GB10's shared memory; the quality dip is the fp8 rounding of K/V in the sparse
+attention. Our recommendation: keep bf16 unless you actually need > 500k tokens in one
+request or 2× the concurrency at 500k, and re-check your own workload's quality if you
+switch. Attention blocks become 3,184 tokens in this mode (page alignment), so prefix
+caching captures Mamba states less often.
+
+```bash
+KV_DTYPE=fp8_e4m3 YARN=1 CTX=1000000 GPU_MEM=0.80 MODE=hybrid scripts/serve.sh
+```
+
 ## Tuning (env vars for `scripts/serve.sh`)
 
 | Var | Default | Notes |
 |---|---|---|
 | `MODE` | `nvfp4` | `hybrid` = fp8 side layers (see above; needs `scripts/prepare-hybrid.sh`). |
 | `PREFIX_CACHE` | `1` | `--enable-prefix-caching`. Correct with this image (block_size fix). |
-| `EXACT_TOPK` | `1` | Exact, deterministic QSA top-k. `0` = stock kernel, faster long prefill, non-deterministic. |
+| `EXACT_TOPK` | `1` | Exact, deterministic QSA top-k. **Costs prefill on long prompts: −8% at 8k, −20–40% at 32k+** (decode unchanged; with prefix caching only the new tokens pay it). `0` = stock kernel: full prefill speed, but non-deterministic and may drop attention candidates (issue #3). |
 | `PORT` | `18300` | API port |
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
 | `GPU_MEM` | `0.85` | Fraction of the 128 GB pool for weights+KV. `0.875` got OOM-killed on a 300k-token prefill with MTP; for long-running service we run `0.80`, because after a day at `0.85` the box drifted into swap. Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). |
-| `KV_DTYPE` | `auto` | Keep `auto` (bf16): `fp8` is refused — the QSA layers require a bf16 KV cache. |
+| `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](#optional-fp8-kv-cache-1m-context) before using it. |
 | `PREWARM` | `0` | `1` streams the 48 GiB table once at boot to warm the page cache — steadier first-request latency, ~10 s extra startup. |
 | `WORKERS` | `32` | Threads used for the mmap gather (only used above `VLLM_PLE_MMAP_FAST_ROWS`=512 unique rows; decode-sized gathers run inline). |
 | `EXTRA` | | Extra vLLM flags, passed verbatim. |
@@ -328,6 +368,7 @@ src/mamba_utils_guarded.py        3. vllm#50729 + bounds guard (drop-in mamba_ut
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
 src/patch_qsa_exact_topk.py       5. exact, deterministic QSA top-k                  VLLM_QSA_EXACT_TOPK=1
 src/vllm_fp8_hybrid_modelopt.py   6. NVFP4 experts + fp8 side layers dispatch        VLLM_FP8_HYBRID=1
+src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nanetnounou) --kv-cache-dtype fp8_e4m3
 src/test_ple_mmap_cpu.py          CPU unit test for the gather (no GPU needed)
 src/test_qsa_exact_topk_cpu.py    CPU unit test for the exact top-k (no GPU needed)
 tools/fp8_convert.py              side-layer bf16 -> blockwise fp8 (by @Saren-Arterius)
@@ -352,9 +393,9 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
   starves the KV cache — we moved ours to another machine).
 - **Full `torch.compile` is off** (an Inductor int64-indexing assert on sm_121); the
   serve script uses PIECEWISE CUDA graphs with the PLE lookup as a splitting op.
-- **1M context is out of reach on one box**: the QSA layers refuse an fp8 KV cache, and
-  in bf16 a single 1M request needs ~30 GiB of KV. 500k with YaRN is the validated
-  ceiling; 800k booted but got OOM-killed on a long prefill.
+- **1M context** needs the fp8 KV cache (`KV_DTYPE=fp8_e4m3`, see above), which costs
+  speed and some quality; in bf16 a single 1M request needs ~26 GiB of KV and 500k with
+  YaRN is the validated ceiling (800k booted but got OOM-killed on a long prefill).
 - **Exact top-k costs prefill** on long prompts (see above). The implementation is a
   plain `torch.topk` over the full visible width per chunk; a fused kernel would recover
   most of it — PRs welcome.
@@ -371,6 +412,8 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx tes
 - GB10 FLA fixes, the faster PLE gather, the state-copy guard and the fp8 side-layer
   conversion: **[@Saren-Arterius](https://github.com/Saren-Arterius)**
   ([qwen3.8-Flash-DGX-AutoRound](https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound)).
+- The fp8_e4m3 KV cache patch for the QSA path: **[@Nanetnounou](https://github.com/Nanetnounou)**
+  ([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6), [vllm#54426](https://github.com/vllm-project/vllm/issues/54426)).
 - The non-deterministic `persistent_topk` diagnosis and upstream report:
   **[@k3dani](https://github.com/k3dani)** ([issue #3](https://github.com/blazux/qwen3.8-Flash-DGX/issues/3),
   [vllm#51782](https://github.com/vllm-project/vllm/issues/51782)).
