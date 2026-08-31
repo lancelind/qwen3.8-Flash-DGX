@@ -1,7 +1,9 @@
 recipe_version: "2"
 model: travelinlance/Qwen3.8-Flash-Next-RadixArk-NVFP4-Hybrid-Sharp
 runtime: vllm
-container: ghcr.io/lancelind/qwen38-flash-dgx:latest
+# Pinned by digest (= :latest as of 2026-08-31, built from main @ a35c3cc by CI)
+# so the leaderboard submission references an immutable image. Bump on release.
+container: ghcr.io/lancelind/qwen38-flash-dgx@sha256:62a77b7c2806385cd23aeb7f6c4979b29f1b0db941bdc0f4791da90aa15f5bb9
 min_nodes: 1
 max_nodes: 1
 
@@ -12,19 +14,33 @@ executor_config:
 
 metadata:
   description: >-
-    Qwen3.8-Flash-Next NVFP4 with fp8-hybrid side layers and the Sharp chat
-    template (travelinlance build) on a single DGX Spark / GB10. PLE lookups
-    run as a GPU kernel reading the mmap'd n-gram table directly through ATS —
-    decode inside the CUDA graphs, prefill as page-cache warm (madvise + CPU
-    touch threads) followed by the same GPU gather. Speculative decoding OFF
-    and gpu_memory_utilization 0.75: measured on-box 2026-08-30/31 UTC (client
-    concurrency C=1/2/5/10 with max_num_seqs 8, random 2048-in/256-out), MTP
-    costs aggregate throughput at concurrency on this bandwidth-bound part,
-    and the lower reservation returns ~14 GB to the page cache serving the
-    47.7 GiB table. vs the shipped hybrid-sharp CPU gather: sum decode
-    21->21, 28->36, 33->58, 38->76 tok/s at C=1/2/5/10; C=1 TTFT P99
-    4003 -> 1313 ms; GPU SM 96% sustained. No manual prep: kernel ships
-    compiled in the image.
+    Qwen3.8-Flash-Next (~176B MoE) on a single DGX Spark / GB10. Model card:
+    https://huggingface.co/travelinlance/Qwen3.8-Flash-Next-RadixArk-NVFP4-Hybrid-Sharp
+    — RadixArk's ModelOpt NVFP4 quantization with two additions by
+    travelinlance: ~15 GiB of per-token side layers (attention projections,
+    shared experts) converted to blockwise fp8-e4m3 (~20% faster decode,
+    conversion tool by @Saren-Arterius), and the Sharp chat template
+    (peculiar-ragdoll, froggeric v22.1 line; ~18% fewer output tokens).
+    Serving image ghcr.io/lancelind/qwen38-flash-dgx (source:
+    https://github.com/lancelind/qwen3.8-Flash-DGX, fork of
+    https://github.com/blazux/qwen3.8-Flash-DGX) layers on the official
+    vllm-openai qwen38-flash-next image: PLE n-gram table served from NVMe
+    via mmap (blazux — what makes 176B fit in 128 GB); v2 GPU table gather
+    (lancelind): a CUDA kernel reads the mmap'd table directly through ATS
+    inside the piecewise CUDA graphs, with decode-ahead page-cache warming,
+    replacing the CPU gather; GB10 FLA shared-memory/warp fixes, mamba
+    state-copy guard and fast gather path (@Saren-Arterius); mamba race fix
+    vllm#50729 (@AndreasKaratzas); prefix-caching block_size fix and exact
+    deterministic QSA top-k (blazux, vllm#51782 reported by @k3dani); NVFP4 +
+    fp8 hybrid loader; fp8_e4m3 KV cache option (@Nanetnounou, inert here);
+    tool_choice required/named enforcement fix (lancelind). Config measured
+    on-box 2026-08-30/31 UTC (C=1/2/5/10, max_num_seqs 8, 2048-in/256-out):
+    speculative decoding OFF (MTP costs aggregate throughput at concurrency
+    on this bandwidth-bound part) and gpu_memory_utilization 0.75 (frees
+    ~14 GB for the page cache serving the 47.7 GiB table). vs the v1 CPU
+    gather recipe: sum decode 21->21, 28->36, 33->58, 38->76 tok/s at
+    C=1/2/5/10; C=1 TTFT P99 4003 -> 1313 ms; GPU SM 96% sustained. No
+    manual prep: the gather kernel ships compiled in the image.
   maintainer: lancelind
   # VRAM override (units: GB): hybrid side layers cut resident weights below
   # the nvfp4 build's ~76 GB; PLE table lives on NVMe via mmap.
