@@ -51,8 +51,7 @@ for fi in range(2):
 with open(os.path.join(tmp, "model.safetensors.index.json"), "w") as f:
     json.dump({"weight_map": file_of}, f)
 
-shards, dtype_str, scale_entry = m._find_shards(tmp, 1)
-cols = shards.pop("__cols__")
+shards, cols, dtype_str, scale_entry = m._find_shards(tmp, 1)
 assert dtype_str == "F8_E4M3" and cols == COLS, (dtype_str, cols)
 assert len(shards) == PARTS, len(shards)
 assert abs(float(m._read_scale(scale_entry)) - 0.03125) < 1e-9

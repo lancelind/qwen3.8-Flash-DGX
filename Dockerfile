@@ -24,6 +24,9 @@ ARG PLE=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
 
 # --- 1. PLE n-gram table from disk ------------------------------------------------
 COPY src/vllm_ple_mmap.py ${SP}/vllm_ple_mmap.py
+# Unit tests ship in the image so the serving container can self-verify:
+#   python3 /opt/test_ple_mmap_unit.py
+COPY src/test_ple_mmap_unit.py /opt/test_ple_mmap_unit.py
 RUN cp ${PLE} ${PLE}.orig \
  && printf '\n\n# --- qwen38-flash-dgx: serve the PLE n-gram table from disk (VLLM_PLE_MMAP=1) ---\nfrom vllm_ple_mmap import apply as _ple_mmap_apply\n_ple_mmap_apply(Qwen3_8FlashNextNGramEmbedding)\n' >> ${PLE} \
  && python3 -c "import ast; ast.parse(open('${PLE}').read()); print('ple_layer.py patched OK')"
@@ -100,9 +103,16 @@ RUN python3 /tmp/patch_toolchoice_enforcement.py ${SP} && rm /tmp/patch_toolchoi
 # CPU sync — and the lookup becomes CUDA-graph-capturable, so `ple_mmap_lookup`
 # no longer has to split the piecewise graphs. Probe-verified on-box: gathers
 # byte-identical to CPU, 0.195 ms warm / 0.216 ms in-graph for 4096 x 160 B.
-# Off by default; the CPU gather path is unchanged and remains the fallback.
-# sm_121 = GB10 (verified against this toolchain's --list-gpu-arch).
+# Off by default. With VLLM_PLE_GPU_GATHER=1 the GPU kernel serves ALL table
+# reads (decode in-graph; prefill as page-cache warm + the same kernel); the
+# CPU gather path remains only as the fallback when this .so fails to load.
+# sm_121 = GB10 (verified against this toolchain's --list-gpu-arch); the
+# compute_121 PTX is embedded too so newer parts can JIT instead of failing
+# to launch. The module also test-gathers one row at model load and aborts
+# boot if ATS reads don't work on the running device.
 COPY src/ple_gpu_gather.cu /tmp/ple_gpu_gather.cu
-RUN nvcc -O2 -shared -Xcompiler -fPIC -gencode arch=compute_121,code=sm_121 \
+RUN nvcc -O2 -shared -Xcompiler -fPIC \
+      -gencode arch=compute_121,code=sm_121 \
+      -gencode arch=compute_121,code=compute_121 \
       -o /opt/ple_gpu_gather.so /tmp/ple_gpu_gather.cu \
  && rm /tmp/ple_gpu_gather.cu && ls -la /opt/ple_gpu_gather.so
